@@ -5,8 +5,17 @@ import threading
 import time
 import ctypes
 from enum import Enum, IntEnum
+from typing import NamedTuple, Any
 
 IF_NAME = 'enx68e1dc123fd9'
+TARGET_VELOCITY = 300_000  # [pulse/s]
+ACCEL_TIME = 1.0  # [s]
+CYCLE_TIME_NS = 1_000_000  # [ns]
+
+COMMAND_FILTER_TIME = 10  # [ms]
+SVE_RATE = 1000  # [0.1%]
+SVE_POSITION_GAIN = 10
+SVE_VELOCITY_GAIN = 20
 
 
 def from_ctype(data, ctype):
@@ -40,6 +49,18 @@ class ControlWord(Enum):
     QUICK_STOP = 0b0010
     SWITCH_ON_AND_DISABLE_OPERATION = 0b0111
     SWITCH_ON_AND_ENABLE_OPERATION = 0b1111
+
+
+class CurrentControlMode(IntEnum):
+    CCM_INPUT = 0
+    CST = 1
+    SVE = 2
+
+
+class Field(NamedTuple):
+    index: int
+    subindex: int
+    ctype: Any
 
 
 def format_status_word(status: int) -> str:
@@ -85,33 +106,56 @@ class EcMaster:
     def __del__(self):
         self._master.close()
 
+    def sdo_write(self, slave_index: int, field: Field, data):
+        slave = self._master.slaves[slave_index]
+        slave.sdo_write(index=field.index, subindex=field.subindex,
+                        data=bytes(field.ctype(data)))
+
     def AZD2A_KED_setup(self, slave_index: int):
         """Config function that will be called when transitioning
         from PreOP state to SafeOPstate."""
+
+        SM2_PDO_SIZE = Field(index=0x1C12, subindex=0, ctype=ctypes.c_uint8)
+        SM3_PDO_SIZE = Field(index=0x1C13, subindex=0, ctype=ctypes.c_uint8)
+        PDO_MAP_AXIS1_RX_1_SIZE = Field(index=0x1600, subindex=0, ctype=ctypes.c_uint8)
+        PDO_MAP_AXIS1_RX_1_ASSIGN1 = Field(index=0x1600, subindex=1, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_SIZE = Field(index=0x1A00, subindex=0, ctype=ctypes.c_uint8)
+        PDO_MAP_AXIS1_TX_1_ASSIGN1 = Field(index=0x1A00, subindex=1, ctype=ctypes.c_uint32)
+        COMMAND_FILTER_TIME_AXIS1 = Field(index=0x412A, subindex=1, ctype=ctypes.c_int16)
+        CURRENT_CONTROL_MODE_AXIS1 = Field(index=0x412D, subindex=1, ctype=ctypes.c_uint8)
+        SVE_RATE_AXIS1 = Field(index=0x412E, subindex=1, ctype=ctypes.c_int16)
+        SVE_POSITION_GAIN_AXIS1 = Field(index=0x412F, subindex=1, ctype=ctypes.c_int16)
+        SVE_VELOCITY_GAIN_AXIS1 = Field(index=0x4130, subindex=1, ctype=ctypes.c_int16)
+
+        TARGET_POSITION_FIELD = 0x607A_00_20
+        TARGET_VELOCITY_FIELD = 0x60FF_00_20
+        FEEDBACK_POSITION_FIELD = 0x6064_00_20
+
+        ## PDO map settings ##
+        self.sdo_write(slave_index, SM2_PDO_SIZE, 0)
+        self.sdo_write(slave_index, SM3_PDO_SIZE, 0)
+
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_RX_1_SIZE, 0)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_RX_1_ASSIGN1, TARGET_POSITION_FIELD)
+        # self.sdo_write(slave_index, PDO_MAP_AXIS1_RX_1_ASSIGN1, TARGET_VELOCITY_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_RX_1_SIZE, 1)
+
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_SIZE, 0)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN1, FEEDBACK_POSITION_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_SIZE, 1)
+
+        self.sdo_write(slave_index, SM2_PDO_SIZE, 1)
+        self.sdo_write(slave_index, SM3_PDO_SIZE, 1)
+        ######################
+
+        self.sdo_write(slave_index, COMMAND_FILTER_TIME_AXIS1, COMMAND_FILTER_TIME)
+        self.sdo_write(slave_index, CURRENT_CONTROL_MODE_AXIS1, CurrentControlMode.SVE)
+        self.sdo_write(slave_index, SVE_RATE_AXIS1, SVE_RATE)
+        self.sdo_write(slave_index, SVE_POSITION_GAIN_AXIS1, SVE_POSITION_GAIN)
+        self.sdo_write(slave_index, SVE_VELOCITY_GAIN_AXIS1, SVE_VELOCITY_GAIN)
+
         slave = self._master.slaves[slave_index]
-
-        # 0x1600: PDO Map object for Axis1 RX #1
-        # 0x1C12: SM2 PDO assign
-        # 0x1C13: SM3 PDO assign
-        # 0x607A_00_20: Target position / Sub index = 0 / Data length = 4 bytes
-
-        slave.sdo_write(index=0x1C12, subindex=0, data=bytes(ctypes.c_uint8(0)))
-        slave.sdo_write(index=0x1C13, subindex=0, data=bytes(ctypes.c_uint8(0)))
-
-        slave.sdo_write(index=0x1600, subindex=0, data=bytes(ctypes.c_uint8(0)))
-        # slave.sdo_write(index=0x1600, subindex=1, data=bytes(ctypes.c_uint32(0x607A_00_20)))
-        slave.sdo_write(index=0x1600, subindex=1, data=bytes(ctypes.c_uint32(0x60FF_00_20)))
-        slave.sdo_write(index=0x1600, subindex=0, data=bytes(ctypes.c_uint8(1)))
-
-        slave.sdo_write(index=0x1A00, subindex=0, data=bytes(ctypes.c_uint8(0)))
-        slave.sdo_write(index=0x1A00, subindex=1, data=bytes(ctypes.c_uint32(0x6064_00_20)))
-        slave.sdo_write(index=0x1A00, subindex=0, data=bytes(ctypes.c_uint8(1)))
-
-        slave.sdo_write(index=0x1C12, subindex=0, data=bytes(ctypes.c_uint8(1)))
-        slave.sdo_write(index=0x1C13, subindex=0, data=bytes(ctypes.c_uint8(1)))
-
-        slave.dc_sync(act=True, sync0_cycle_time=500_000)
-        # time is given in ns -> 500,000ns = 0.5ms
+        slave.dc_sync(act=True, sync0_cycle_time=CYCLE_TIME_NS)
 
     def _processdata_thread(self):
         """Background thread that sends and receives the process-data frame
@@ -130,18 +174,29 @@ class EcMaster:
         Updates the rx PDO every second.
         """
         self._in_op = True
-        # target_position = self.get_feedback_position(0)
-        rate = rospy.Rate(2000)
-        target_velocity = 0
+        target_velocity = TARGET_VELOCITY
+        target_acceleration = target_velocity / ACCEL_TIME
+        target_position = self.get_feedback_position(0)  # [pulse]
+        cycle_time = CYCLE_TIME_NS * 1e-9  # [s]
+        rate = rospy.Rate(1.0 / cycle_time)
+        pulse = 0
+        accel = 0.0
 
         try:
             while not rospy.is_shutdown():
-                target_velocity = min(target_velocity + 100, 400_000)
-                # target_position += dp
-                self._master.slaves[0].output = bytes(ctypes.c_int32(target_velocity))
+                accel += target_acceleration * cycle_time ** 2
+                if accel >= 1.0:
+                    delta = int(accel)
+                    accel -= int(accel)
+                else:
+                    delta = 0
+                pulse = min(pulse + delta, int(target_velocity * cycle_time))
+                target_position += pulse
+                self._master.slaves[0].output = bytes(ctypes.c_int32(target_position))
                 time_now = rospy.Time.now().to_sec() * 1000
                 feedback_position = from_ctype(self._master.slaves[0].input, ctypes.c_int32)
-                print(f"t={time_now:.3f}, target={target_velocity}, feedback={feedback_position}")
+                print(f"t={time_now:.3f}, target={target_position}, fb={feedback_position}, "
+                      f"pulse={pulse}")
                 rate.sleep()
 
         except KeyboardInterrupt:
@@ -283,6 +338,12 @@ class EcMaster:
         slave.sdo_write(index=0x1c33, subindex=1,
                         data=bytes(ctypes.c_uint16(data.value)))
 
+    def reset_alarm(self, slave_index: int):
+        slave = self._master.slaves[slave_index]
+        slave.sdo_write(index=0x40C0, subindex=1, data=bytes(ctypes.c_uint8(0)))
+        time.sleep(0.5)
+        slave.sdo_write(index=0x40C0, subindex=1, data=bytes(ctypes.c_uint8(1)))
+
 
 class EcMasterError(Exception):
     def __init__(self, message):
@@ -293,7 +354,8 @@ if __name__ == '__main__':
     rospy.init_node('test_pysoem')
     master = EcMaster(IF_NAME)
     slave_index = 0
-    master.set_operation_mode(slave_index, OperationMode.CSV)
+    master.reset_alarm(slave_index)
+    master.set_operation_mode(slave_index, OperationMode.CSP)
     master.set_control_word(slave_index, ControlWord.SWITCH_ON_AND_ENABLE_OPERATION)
     master.run()
 
