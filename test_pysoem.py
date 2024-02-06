@@ -8,8 +8,8 @@ from enum import Enum, IntEnum
 from typing import NamedTuple, Any
 
 IF_NAME = 'enx68e1dc123fd9'
-TARGET_VELOCITY = 300_000  # [pulse/s]
-ACCEL_TIME = 1.0  # [s]
+TARGET_VELOCITY = 400_000  # [pulse/s]
+ACCEL_TIME = 0.5  # [s]
 CYCLE_TIME_NS = 1_000_000  # [ns]
 
 COMMAND_FILTER_TIME = 10  # [ms]
@@ -181,16 +181,30 @@ class EcMaster:
         rate = rospy.Rate(1.0 / cycle_time)
         pulse = 0
         accel = 0.0
+        sign = 1
+        i = 0
 
         try:
             while not rospy.is_shutdown():
+                i += 1
+                if i % 3000 == 0:
+                    sign = 1
+                    accel = 0
+                elif i % 3000 == 1000:
+                    sign = 0
+                    accel = 0
+                elif i % 3000 == 2000:
+                    sign = -1
+                    accel = 0
+
                 accel += target_acceleration * cycle_time ** 2
                 if accel >= 1.0:
                     delta = int(accel)
                     accel -= int(accel)
                 else:
                     delta = 0
-                pulse = min(pulse + delta, int(target_velocity * cycle_time))
+
+                pulse = max(min(pulse + sign * delta, int(target_velocity * cycle_time)), 0)
                 target_position += pulse
                 self._master.slaves[0].output = bytes(ctypes.c_int32(target_position))
                 time_now = rospy.Time.now().to_sec() * 1000
