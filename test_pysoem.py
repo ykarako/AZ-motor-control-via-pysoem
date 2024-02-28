@@ -5,21 +5,54 @@ import threading
 import time
 import ctypes
 from enum import Enum, IntEnum
-from typing import NamedTuple, Any
+from typing import NamedTuple, Any, List
 
 IF_NAME = 'enx68e1dc123fd9'
-TARGET_VELOCITY = 400_000  # [pulse/s]
-ACCEL_TIME = 0.5  # [s]
+TARGET_VELOCITY = 200_000  # [pulse/s]
+ACCEL_TIME = 1.0  # [s]
 CYCLE_TIME_NS = 1_000_000  # [ns]
+GEAR_RATIO = 50
+PULSE_PER_REV = 10_000 * GEAR_RATIO  # [pulse/rev]
 
 COMMAND_FILTER_TIME = 10  # [ms]
 SVE_RATE = 1000  # [0.1%]
 SVE_POSITION_GAIN = 10
 SVE_VELOCITY_GAIN = 20
 
+POSITION_ERROR_LIMIT_DEG = 10.0  # [deg]
+OVERLOAD_TIME_SEC = 1.0  # [s]
+QUICK_STOP_TORQUE = 20.0  # [%]
+QUICK_STOP_DECEL = 1_000  # [pulse/s^2]
+
+CTYPE_SIZES = {
+    ctypes.c_int8: 1,
+    ctypes.c_uint8: 1,
+    ctypes.c_int16: 2,
+    ctypes.c_uint16: 2,
+    ctypes.c_int32: 4,
+    ctypes.c_uint32: 4,
+}
+
+CType = Any
+
 
 def from_ctype(data, ctype):
     return ctype.from_buffer_copy(data).value
+
+
+def parse_inputs(data: bytes, ctypes: List[CType]):
+    start_index = 0
+    values = []
+    for ctype in ctypes:
+        end_index = start_index + CTYPE_SIZES[ctype]
+        value = from_ctype(data[start_index:end_index], ctype)
+        start_index = end_index
+        values.append(value)
+    return values
+
+
+def pulse_to_deg(pulse):
+    return (360.0 * pulse / PULSE_PER_REV + 180.0) % 360.0 - 180.0
 
 
 class OperationMode(IntEnum):
@@ -46,7 +79,7 @@ class SM3_SyncType(IntEnum):
 class ControlWord(Enum):
     SHUTDOWN = 0b0110
     DISABLE_VOLTAGE = 0b0000
-    QUICK_STOP = 0b0010
+    QUICK_STOP = 0b1011
     SWITCH_ON_AND_DISABLE_OPERATION = 0b0111
     SWITCH_ON_AND_ENABLE_OPERATION = 0b1111
 
@@ -57,10 +90,20 @@ class CurrentControlMode(IntEnum):
     SVE = 2
 
 
+class QuickStopOption(IntEnum):
+    CURRENT_OFF = 0
+    PROFILE_DECEL_DISABLED = 1
+    QUICKSTOP_DECEL_DISABLED = 2
+    IMMEDIATE_STOP_DISABLED = 3
+    PROFILE_DECEL_ACTIVE = 5
+    QUICKSTOP_DECEL_ACTIVE = 6
+    IMMEDIATE_STOP_ACTIVE = 7
+
+
 class Field(NamedTuple):
     index: int
     subindex: int
-    ctype: Any
+    ctype: CType
 
 
 def format_status_word(status: int) -> str:
@@ -121,6 +164,11 @@ class EcMaster:
         PDO_MAP_AXIS1_RX_1_ASSIGN1 = Field(index=0x1600, subindex=1, ctype=ctypes.c_uint32)
         PDO_MAP_AXIS1_TX_1_SIZE = Field(index=0x1A00, subindex=0, ctype=ctypes.c_uint8)
         PDO_MAP_AXIS1_TX_1_ASSIGN1 = Field(index=0x1A00, subindex=1, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_ASSIGN2 = Field(index=0x1A00, subindex=2, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_ASSIGN3 = Field(index=0x1A00, subindex=3, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_ASSIGN4 = Field(index=0x1A00, subindex=4, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_ASSIGN5 = Field(index=0x1A00, subindex=5, ctype=ctypes.c_uint32)
+        PDO_MAP_AXIS1_TX_1_ASSIGN6 = Field(index=0x1A00, subindex=6, ctype=ctypes.c_uint32)
         COMMAND_FILTER_TIME_AXIS1 = Field(index=0x412A, subindex=1, ctype=ctypes.c_int16)
         CURRENT_CONTROL_MODE_AXIS1 = Field(index=0x412D, subindex=1, ctype=ctypes.c_uint8)
         SVE_RATE_AXIS1 = Field(index=0x412E, subindex=1, ctype=ctypes.c_int16)
@@ -128,10 +176,15 @@ class EcMaster:
         SVE_VELOCITY_GAIN_AXIS1 = Field(index=0x4130, subindex=1, ctype=ctypes.c_int16)
 
         TARGET_POSITION_FIELD = 0x607A_00_20
-        TARGET_VELOCITY_FIELD = 0x60FF_00_20
+        # TARGET_VELOCITY_FIELD = 0x60FF_00_20
+        STATUS_WORD_FIELD = 0x6041_00_10
         FEEDBACK_POSITION_FIELD = 0x6064_00_20
+        FEEDBACK_VELOCITY_FIELD = 0x606C_00_20
+        POSITION_ERROR_FIELD = 0x60F4_00_20
+        TORQUE_MONITOR_FIELD = 0x406B_01_10
+        CURRENT_ALARM_FIELD = 0x4040_01_10
 
-        ## PDO map settings ##
+        # ---- PDO map settings --------
         self.sdo_write(slave_index, SM2_PDO_SIZE, 0)
         self.sdo_write(slave_index, SM3_PDO_SIZE, 0)
 
@@ -142,11 +195,20 @@ class EcMaster:
 
         self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_SIZE, 0)
         self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN1, FEEDBACK_POSITION_FIELD)
-        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_SIZE, 1)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN2, FEEDBACK_VELOCITY_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN3, POSITION_ERROR_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN4, TORQUE_MONITOR_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN5, CURRENT_ALARM_FIELD)
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_ASSIGN6, STATUS_WORD_FIELD)
+        self.input_types = [
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int16, ctypes.c_uint16,
+            ctypes.c_uint16
+        ]
+        self.sdo_write(slave_index, PDO_MAP_AXIS1_TX_1_SIZE, len(self.input_types))
 
         self.sdo_write(slave_index, SM2_PDO_SIZE, 1)
         self.sdo_write(slave_index, SM3_PDO_SIZE, 1)
-        ######################
+        # ------------------------------
 
         self.sdo_write(slave_index, COMMAND_FILTER_TIME_AXIS1, COMMAND_FILTER_TIME)
         self.sdo_write(slave_index, CURRENT_CONTROL_MODE_AXIS1, CurrentControlMode.SVE)
@@ -183,19 +245,28 @@ class EcMaster:
         accel = 0.0
         sign = 1
         i = 0
+        i_accel = int(ACCEL_TIME / cycle_time)
+        quick_stopped = False
 
         try:
             while not rospy.is_shutdown():
                 i += 1
-                if i % 3000 == 0:
+                if i % (i_accel * 4) == 0:
                     sign = 1
                     accel = 0
-                elif i % 3000 == 1000:
+                    target_acceleration = target_velocity / ACCEL_TIME
+                elif i % (i_accel * 4) == (i_accel):
                     sign = 0
                     accel = 0
-                elif i % 3000 == 2000:
-                    sign = -1
+                    target_acceleration = 0
+                # elif i % (i_accel * 4) == (i_accel * 2):
+                #     sign = -1
+                #     accel = 0
+                #     target_acceleration = target_velocity / ACCEL_TIME / 1
+                elif i % (i_accel * 4) == (i_accel * 3):
+                    sign = 0
                     accel = 0
+                    target_acceleration = 0
 
                 accel += target_acceleration * cycle_time ** 2
                 if accel >= 1.0:
@@ -209,8 +280,19 @@ class EcMaster:
                 self._master.slaves[0].output = bytes(ctypes.c_int32(target_position))
                 time_now = rospy.Time.now().to_sec() * 1000
                 feedback_position = from_ctype(self._master.slaves[0].input, ctypes.c_int32)
-                print(f"t={time_now:.3f}, target={target_position}, fb={feedback_position}, "
-                      f"pulse={pulse}")
+                feedback_position, feedback_velocity, error, torque, alarm, status = \
+                    parse_inputs(self._master.slaves[0].input, self.input_types)
+                error_deg = pulse_to_deg(error)
+                print(f"[{i:5d}] t={time_now%1000:5.1f}ms, "
+                      f"pulse={pulse:3d}, "
+                      f"v={int(feedback_velocity / PULSE_PER_REV * 60):3d}rpm, "
+                      f"err={error_deg:+6.2f}deg, "
+                      f"T={torque / 10:+5.1f}%, "
+                      f"alarm=0x{alarm:02x}, status={status:016b}")
+                if not quick_stopped and abs(torque / 10) > QUICK_STOP_TORQUE:
+                    master.set_control_word(0, ControlWord.QUICK_STOP)
+                    print("Quick Stop!!!!")
+                    quick_stopped = True
                 rate.sleep()
 
         except KeyboardInterrupt:
@@ -358,6 +440,32 @@ class EcMaster:
         time.sleep(0.5)
         slave.sdo_write(index=0x40C0, subindex=1, data=bytes(ctypes.c_uint8(1)))
 
+    def set_brake_without_excitation(self, slave_index: int, enabled: False):
+        slave = self._master.slaves[slave_index]
+        if enabled:
+            slave.sdo_write(index=0x413D, subindex=1, data=bytes(ctypes.c_uint8(0)))
+        else:
+            slave.sdo_write(index=0x413D, subindex=1, data=bytes(ctypes.c_uint8(1)))
+
+    def set_alarm_conditions(self, slave_index: int,
+                             position_error_limit_deg: float = 10.0,
+                             overload_time_sec: float = 5.0,
+                             quickstop_option=QuickStopOption.QUICKSTOP_DECEL_DISABLED,
+                             quickstop_decel: int = 1_000_000,
+                             ):
+        slave = self._master.slaves[slave_index]
+        position_error_limit = int(position_error_limit_deg * GEAR_RATIO / 360.0 * 100)  # [0.01 rev]
+        overload_time = int(overload_time_sec * 10)  # [0.1 sec]
+        print(f"position_error_limit={position_error_limit}")
+        print(f"overload_time={overload_time}")
+        print(f"quicksto_option={quickstop_option.name}")
+        print(f"quicksto_decel={quickstop_decel}")
+        slave.sdo_write(index=0x6065, subindex=0, data=bytes(ctypes.c_uint32(position_error_limit)))
+        slave.sdo_write(index=0x4180, subindex=1, data=bytes(ctypes.c_int16(overload_time)))
+        slave.sdo_write(index=0x605A, subindex=0, data=bytes(ctypes.c_int16(quickstop_option)))
+        slave.sdo_write(index=0x6085, subindex=0, data=bytes(ctypes.c_uint32(quickstop_decel)))
+        print(from_ctype(slave.sdo_read(index=0x6084, subindex=0), ctypes.c_uint32))
+
 
 class EcMasterError(Exception):
     def __init__(self, message):
@@ -369,7 +477,10 @@ if __name__ == '__main__':
     master = EcMaster(IF_NAME)
     slave_index = 0
     master.reset_alarm(slave_index)
+    master.set_brake_without_excitation(slave_index, False)
     master.set_operation_mode(slave_index, OperationMode.CSP)
+    master.set_alarm_conditions(slave_index, POSITION_ERROR_LIMIT_DEG, OVERLOAD_TIME_SEC,
+                                QuickStopOption.QUICKSTOP_DECEL_DISABLED, QUICK_STOP_DECEL)
     master.set_control_word(slave_index, ControlWord.SWITCH_ON_AND_ENABLE_OPERATION)
     master.run()
 
